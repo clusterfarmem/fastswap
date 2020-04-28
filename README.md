@@ -93,6 +93,8 @@ node ip, cip is this node ip (client) and nq must be set to the number of cpus
 available in the system. If you type dmesg and you see "ctrl is ready for reqs"
 then the connection was successful!
 
+A good next step would be to try out our CFM framework: https://github.com/clusterfarmem/cfm
+
 ## DRAM backend
 
 You can use the DRAM backend for experimentation. Compile and load as follows:

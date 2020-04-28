@@ -92,3 +92,15 @@ sport is the port where the far memory server is running, sip is the far memory
 node ip, cip is this node ip (client) and nq must be set to the number of cpus
 available in the system. If you type dmesg and you see "ctrl is ready for reqs"
 then the connection was successful!
+
+## DRAM backend
+
+You can use the DRAM backend for experimentation. Compile and load as follows:
+
+    cd drivers
+    make BACKEND=DRAM
+    sudo insmod fastswap_dram.ko
+    sudo insmod fastswap.ko
+    
+You still need to have swap device enabled, but data won't flow there. By default
+the DRAM backend will allocate 32GB of memory.

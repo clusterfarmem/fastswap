@@ -105,6 +105,8 @@ You can use the DRAM backend for experimentation. Compile and load as follows:
 You still need to have swap device enabled, but data won't flow there. By default
 the DRAM backend will allocate 32GB of memory.
 
-## Questions
+## Further reading
+For more information, please refer to our [paper](https://dl.acm.org/doi/abs/10.1145/3342195.3387522) accepted at [EUROSYS 2020](https://www.eurosys2020.org/)
 
+## Questions
 For additional questions please contact us at cfm@lists.eecs.berkeley.edu

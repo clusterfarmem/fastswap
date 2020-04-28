@@ -1,0 +1,512 @@
+diff --git a/include/linux/frontswap.h b/include/linux/frontswap.h
+index 1d18af03..6a15babc 100644
+--- a/include/linux/frontswap.h
++++ b/include/linux/frontswap.h
+@@ -10,6 +10,8 @@ struct frontswap_ops {
+ 	void (*init)(unsigned); /* this swap type was just swapon'ed */
+ 	int (*store)(unsigned, pgoff_t, struct page *); /* store a page */
+ 	int (*load)(unsigned, pgoff_t, struct page *); /* load a page */
++	int (*load_async)(unsigned, pgoff_t, struct page *); /* load a page async */
++	int (*poll_load)(int); /* poll cpu for one load */
+ 	void (*invalidate_page)(unsigned, pgoff_t); /* page no longer needed */
+ 	void (*invalidate_area)(unsigned); /* swap type just swapoff'ed */
+ 	struct frontswap_ops *next; /* private pointer to next ops */
+@@ -26,6 +28,8 @@ extern bool __frontswap_test(struct swap_info_struct *, pgoff_t);
+ extern void __frontswap_init(unsigned type, unsigned long *map);
+ extern int __frontswap_store(struct page *page);
+ extern int __frontswap_load(struct page *page);
++extern int __frontswap_load_async(struct page *page);
++extern int __frontswap_poll_load(int cpu);
+ extern void __frontswap_invalidate_page(unsigned, pgoff_t);
+ extern void __frontswap_invalidate_area(unsigned);
+ 
+@@ -92,6 +96,22 @@ static inline int frontswap_load(struct page *page)
+ 	return -1;
+ }
+ 
++static inline int frontswap_load_async(struct page *page)
++{
++	if (frontswap_enabled())
++		return __frontswap_load_async(page);
++
++	return -1;
++}
++
++static inline int frontswap_poll_load(int cpu)
++{
++	if (frontswap_enabled())
++		return __frontswap_poll_load(cpu);
++
++	return -1;
++}
++
+ static inline void frontswap_invalidate_page(unsigned type, pgoff_t offset)
+ {
+ 	if (frontswap_enabled())
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 45e91dd6..c052b901 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -156,7 +156,7 @@ enum {
+ 	SWP_SCANNING	= (1 << 11),	/* refcount in scan_swap_map */
+ };
+ 
+-#define SWAP_CLUSTER_MAX 32UL
++#define SWAP_CLUSTER_MAX 64UL
+ #define COMPACT_CLUSTER_MAX SWAP_CLUSTER_MAX
+ 
+ #define SWAP_MAP_MAX	0x3e	/* Max duplication count, in first swap_map */
+@@ -332,6 +332,7 @@ extern void kswapd_stop(int nid);
+ 
+ /* linux/mm/page_io.c */
+ extern int swap_readpage(struct page *);
++extern int swap_readpage_sync(struct page *);
+ extern int swap_writepage(struct page *page, struct writeback_control *wbc);
+ extern void end_swap_bio_write(struct bio *bio);
+ extern int __swap_writepage(struct page *page, struct writeback_control *wbc,
+diff --git a/mm/frontswap.c b/mm/frontswap.c
+index fec8b504..6cdab53d 100644
+--- a/mm/frontswap.c
++++ b/mm/frontswap.c
+@@ -264,8 +264,8 @@ int __frontswap_store(struct page *page)
+ 	 */
+ 	if (__frontswap_test(sis, offset)) {
+ 		__frontswap_clear(sis, offset);
+-		for_each_frontswap_ops(ops)
+-			ops->invalidate_page(type, offset);
++		//for_each_frontswap_ops(ops)
++		//	ops->invalidate_page(type, offset);
+ 	}
+ 
+ 	/* Try to store in each implementation, until one succeeds. */
+@@ -325,6 +325,50 @@ int __frontswap_load(struct page *page)
+ }
+ EXPORT_SYMBOL(__frontswap_load);
+ 
++int __frontswap_load_async(struct page *page)
++{
++	int ret = -1;
++	swp_entry_t entry = { .val = page_private(page), };
++	int type = swp_type(entry);
++	struct swap_info_struct *sis = swap_info[type];
++	pgoff_t offset = swp_offset(entry);
++	struct frontswap_ops *ops;
++
++	VM_BUG_ON(!frontswap_ops);
++	VM_BUG_ON(!PageLocked(page));
++	VM_BUG_ON(sis == NULL);
++
++	if (!__frontswap_test(sis, offset))
++		return -1;
++
++	/* Try loading from each implementation, until one succeeds. */
++	for_each_frontswap_ops(ops) {
++		ret = ops->load_async(type, offset, page);
++		if (!ret) /* successful load */
++			break;
++	}
++	if (ret == 0)
++		inc_frontswap_loads();
++
++	return ret;
++}
++EXPORT_SYMBOL(__frontswap_load_async);
++
++int __frontswap_poll_load(int cpu)
++{
++	struct frontswap_ops *ops;
++
++	VM_BUG_ON(!frontswap_ops);
++
++	/* Try loading from each implementation, until one succeeds. */
++	for_each_frontswap_ops(ops)
++		return ops->poll_load(cpu);
++
++	BUG();
++	return -1;
++}
++EXPORT_SYMBOL(__frontswap_poll_load);
++
+ /*
+  * Invalidate any data from frontswap associated with the specified swaptype
+  * and offset so that a subsequent "get" will fail.
+@@ -332,7 +376,7 @@ EXPORT_SYMBOL(__frontswap_load);
+ void __frontswap_invalidate_page(unsigned type, pgoff_t offset)
+ {
+ 	struct swap_info_struct *sis = swap_info[type];
+-	struct frontswap_ops *ops;
++	//struct frontswap_ops *ops;
+ 
+ 	VM_BUG_ON(!frontswap_ops);
+ 	VM_BUG_ON(sis == NULL);
+@@ -340,8 +384,8 @@ void __frontswap_invalidate_page(unsigned type, pgoff_t offset)
+ 	if (!__frontswap_test(sis, offset))
+ 		return;
+ 
+-	for_each_frontswap_ops(ops)
+-		ops->invalidate_page(type, offset);
++	//for_each_frontswap_ops(ops)
++	//	ops->invalidate_page(type, offset);
+ 	__frontswap_clear(sis, offset);
+ 	inc_frontswap_invalidates();
+ }
+@@ -480,6 +524,25 @@ unsigned long frontswap_curr_pages(void)
+ }
+ EXPORT_SYMBOL(frontswap_curr_pages);
+ 
++static int show_curr_pages(struct seq_file *m, void *v)
++{
++	seq_printf(m, "%lu", frontswap_curr_pages());
++	return 0;
++}
++
++static int curr_pages_open(struct inode *inode, struct  file *file)
++{
++	return single_open(file, show_curr_pages, NULL);
++}
++
++static const struct file_operations fops = {
++	.llseek = seq_lseek,
++	.open = curr_pages_open,
++	.owner = THIS_MODULE,
++	.read = seq_read,
++	.release = single_release,
++};
++
+ static int __init init_frontswap(void)
+ {
+ #ifdef CONFIG_DEBUG_FS
+@@ -492,6 +555,7 @@ static int __init init_frontswap(void)
+ 				&frontswap_failed_stores);
+ 	debugfs_create_u64("invalidates", S_IRUGO,
+ 				root, &frontswap_invalidates);
++	debugfs_create_file("curr_pages", S_IRUGO, root, NULL, &fops);
+ #endif
+ 	return 0;
+ }
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 2bd7541d..53027aaa 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -94,6 +94,8 @@ int do_swap_account __read_mostly;
+ #define do_swap_account		0
+ #endif
+ 
++#define FASTSWAP_RECLAIM_CPU	7
++
+ /* Whether legacy memory+swap accounting is active */
+ static bool do_memsw_account(void)
+ {
+@@ -1842,12 +1844,23 @@ static void reclaim_high(struct mem_cgroup *memcg,
+ 	} while ((memcg = parent_mem_cgroup(memcg)));
+ }
+ 
++#define MAX_RECLAIM_OFFLOAD 2048UL
+ static void high_work_func(struct work_struct *work)
+ {
+-	struct mem_cgroup *memcg;
++	struct mem_cgroup *memcg = container_of(work, struct mem_cgroup, high_work);
++	unsigned long high = memcg->high;
++	unsigned long nr_pages = page_counter_read(&memcg->memory);
++	unsigned long reclaim;
++
++	if (nr_pages > high) {
++		reclaim = min(nr_pages - high, MAX_RECLAIM_OFFLOAD);
++
++		/* reclaim_high only reclaims iff nr_pages > high */
++		reclaim_high(memcg, reclaim, GFP_KERNEL);
++	}
+ 
+-	memcg = container_of(work, struct mem_cgroup, high_work);
+-	reclaim_high(memcg, CHARGE_BATCH, GFP_KERNEL);
++	if (page_counter_read(&memcg->memory) > memcg->high)
++		schedule_work_on(FASTSWAP_RECLAIM_CPU, &memcg->high_work);
+ }
+ 
+ /*
+@@ -1865,6 +1878,7 @@ void mem_cgroup_handle_over_high(void)
+ 	memcg = get_mem_cgroup_from_mm(current->mm);
+ 	reclaim_high(memcg, nr_pages, GFP_KERNEL);
+ 	css_put(&memcg->css);
++
+ 	current->memcg_nr_pages_over_high = 0;
+ }
+ 
+@@ -1878,6 +1892,9 @@ static int try_charge(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 	unsigned long nr_reclaimed;
+ 	bool may_swap = true;
+ 	bool drained = false;
++	unsigned long high_limit;
++	unsigned long curr_pages;
++	unsigned long excess;
+ 
+ 	if (mem_cgroup_is_root(memcg))
+ 		return 0;
+@@ -2006,14 +2023,20 @@ done_restock:
+ 	 * reclaim, the cost of mismatch is negligible.
+ 	 */
+ 	do {
+-		if (page_counter_read(&memcg->memory) > memcg->high) {
+-			/* Don't bother a random interrupted task */
+-			if (in_interrupt()) {
+-				schedule_work(&memcg->high_work);
+-				break;
++		high_limit = memcg->high;
++		curr_pages = page_counter_read(&memcg->memory);
++
++		if (curr_pages > high_limit) {
++			excess = curr_pages - high_limit;
++			/* regardless of whether we use app cpu or worker, we evict
++			 * at most MAX_RECLAIM_OFFLOAD pages at a time */
++			if (excess > MAX_RECLAIM_OFFLOAD && !in_interrupt()) {
++				current->memcg_nr_pages_over_high += MAX_RECLAIM_OFFLOAD;
++				set_notify_resume(current);
++			} else {
++				schedule_work_on(FASTSWAP_RECLAIM_CPU, &memcg->high_work);
+ 			}
+-			current->memcg_nr_pages_over_high += batch;
+-			set_notify_resume(current);
++
+ 			break;
+ 		}
+ 	} while ((memcg = parent_mem_cgroup(memcg)));
+@@ -5081,7 +5104,6 @@ static ssize_t memory_high_write(struct kernfs_open_file *of,
+ 				 char *buf, size_t nbytes, loff_t off)
+ {
+ 	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+-	unsigned long nr_pages;
+ 	unsigned long high;
+ 	int err;
+ 
+@@ -5092,12 +5114,9 @@ static ssize_t memory_high_write(struct kernfs_open_file *of,
+ 
+ 	memcg->high = high;
+ 
+-	nr_pages = page_counter_read(&memcg->memory);
+-	if (nr_pages > high)
+-		try_to_free_mem_cgroup_pages(memcg, nr_pages - high,
+-					     GFP_KERNEL, true);
+-
++	/* concurrent eviction on shrink */
+ 	memcg_wb_domain_size_changed(memcg);
++	schedule_work_on(FASTSWAP_RECLAIM_CPU, &memcg->high_work);
+ 	return nbytes;
+ }
+ 
+diff --git a/mm/memory.c b/mm/memory.c
+index 235ba51b..2e7b3f80 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -68,6 +68,8 @@
+ #include <linux/debugfs.h>
+ #include <linux/userfaultfd_k.h>
+ #include <linux/dax.h>
++#include <linux/frontswap.h>
++#include <linux/delay.h>
+ 
+ #include <asm/io.h>
+ #include <asm/mmu_context.h>
+@@ -2698,6 +2700,7 @@ int do_swap_page(struct vm_fault *vmf)
+ 		}
+ 		goto out;
+ 	}
++
+ 	delayacct_set_flag(DELAYACCT_PF_SWAPIN);
+ 	page = lookup_swap_cache(entry);
+ 	if (!page) {
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 23f6d0d3..40cddf6a 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -3,7 +3,7 @@
+  *
+  *  Copyright (C) 1991, 1992, 1993, 1994  Linus Torvalds
+  *
+- *  Swap reorganised 29.12.95, 
++ *  Swap reorganised 29.12.95,
+  *  Asynchronous swapping added 30.12.95. Stephen Tweedie
+  *  Removed race in async swapping. 14.4.1996. Bruno Haible
+  *  Add swap of shared pages through the page cache. 20.2.1998. Stephen Tweedie
+@@ -338,11 +338,8 @@ int swap_readpage(struct page *page)
+ 	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
+ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 	VM_BUG_ON_PAGE(PageUptodate(page), page);
+-	if (frontswap_load(page) == 0) {
+-		SetPageUptodate(page);
+-		unlock_page(page);
++	if (frontswap_load_async(page) == 0)
+ 		goto out;
+-	}
+ 
+ 	if (sis->flags & SWP_FILE) {
+ 		struct file *swap_file = sis->swap_file;
+@@ -379,6 +376,17 @@ out:
+ 	return ret;
+ }
+ 
++int swap_readpage_sync(struct page *page)
++{
++	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
++	VM_BUG_ON_PAGE(PageUptodate(page), page);
++
++	BUG_ON(frontswap_load(page));
++
++	return 0;
++}
++
+ int swap_set_page_dirty(struct page *page)
+ {
+ 	struct swap_info_struct *sis = page_swap_info(page);
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 473b71e0..0d6b4b3f 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -19,6 +19,7 @@
+ #include <linux/migrate.h>
+ #include <linux/vmalloc.h>
+ #include <linux/swap_slots.h>
++#include <linux/frontswap.h>
+ 
+ #include <asm/pgtable.h>
+ 
+@@ -168,7 +169,7 @@ void __delete_from_swap_cache(struct page *page)
+  * @page: page we want to move to swap
+  *
+  * Allocate swap space for the page and add the page to the
+- * swap cache.  Caller needs to hold the page lock. 
++ * swap cache.  Caller needs to hold the page lock.
+  */
+ int add_to_swap(struct page *page, struct list_head *list)
+ {
+@@ -241,9 +242,9 @@ void delete_from_swap_cache(struct page *page)
+ 	put_page(page);
+ }
+ 
+-/* 
+- * If we are the only user, then try to free up the swap cache. 
+- * 
++/*
++ * If we are the only user, then try to free up the swap cache.
++ *
+  * Its ok to check for PageSwapCache without the page lock
+  * here because we are going to recheck again inside
+  * try_to_free_swap() _with_ the lock.
+@@ -257,7 +258,7 @@ static inline void free_swap_cache(struct page *page)
+ 	}
+ }
+ 
+-/* 
++/*
+  * Perform a free_page(), also freeing any swap cache associated with
+  * this page if it is the last user of the page.
+  */
+@@ -426,6 +427,19 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 	return retpage;
+ }
+ 
++struct page *read_swap_cache_sync(swp_entry_t entry, gfp_t gfp_mask,
++			struct vm_area_struct *vma, unsigned long addr)
++{
++	bool page_was_allocated;
++	struct page *retpage = __read_swap_cache_async(entry, gfp_mask,
++			vma, addr, &page_was_allocated);
++
++	if (page_was_allocated)
++		swap_readpage_sync(retpage);
++
++	return retpage;
++}
++
+ static unsigned long swapin_nr_pages(unsigned long offset)
+ {
+ 	static unsigned long prev_offset;
+@@ -492,12 +506,17 @@ static unsigned long swapin_nr_pages(unsigned long offset)
+ struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
+ 			struct vm_area_struct *vma, unsigned long addr)
+ {
+-	struct page *page;
++	struct page *page, *faultpage;
+ 	unsigned long entry_offset = swp_offset(entry);
+ 	unsigned long offset = entry_offset;
+ 	unsigned long start_offset, end_offset;
+ 	unsigned long mask;
+-	struct blk_plug plug;
++	int cpu;
++
++	preempt_disable();
++	cpu = smp_processor_id();
++	faultpage = read_swap_cache_sync(entry, gfp_mask, vma, addr);
++	preempt_enable();
+ 
+ 	mask = swapin_nr_pages(offset) - 1;
+ 	if (!mask)
+@@ -509,22 +528,25 @@ struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
+ 	if (!start_offset)	/* First page is swap header. */
+ 		start_offset++;
+ 
+-	blk_start_plug(&plug);
+ 	for (offset = start_offset; offset <= end_offset ; offset++) {
++		if (offset == entry_offset)
++			continue;
++
+ 		/* Ok, do the async read-ahead now */
+ 		page = read_swap_cache_async(swp_entry(swp_type(entry), offset),
+ 						gfp_mask, vma, addr);
+ 		if (!page)
+ 			continue;
+-		if (offset != entry_offset)
+-			SetPageReadahead(page);
++
++		SetPageReadahead(page);
+ 		put_page(page);
+ 	}
+-	blk_finish_plug(&plug);
+ 
+ 	lru_add_drain();	/* Push any new pages onto the LRU now */
++	/* prefetch pages generate interrupts and are handled async */
+ skip:
+-	return read_swap_cache_async(entry, gfp_mask, vma, addr);
++	frontswap_poll_load(cpu);
++	return faultpage;
+ }
+ 
+ int init_swap_address_space(unsigned int type, unsigned long nr_pages)
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index bc8031ef..eba9777f 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -964,8 +964,6 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 	unsigned nr_ref_keep = 0;
+ 	unsigned nr_unmap_fail = 0;
+ 
+-	cond_resched();
+-
+ 	while (!list_empty(page_list)) {
+ 		struct address_space *mapping;
+ 		struct page *page;
+@@ -975,8 +973,6 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 		bool lazyfree = false;
+ 		int ret = SWAP_SUCCESS;
+ 
+-		cond_resched();
+-
+ 		page = lru_to_page(page_list);
+ 		list_del(&page->lru);
+ 
+@@ -1208,6 +1204,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 			case PAGE_SUCCESS:
+ 				if (PageWriteback(page))
+ 					goto keep;
++
+ 				if (PageDirty(page))
+ 					goto keep;
+ 
+@@ -1330,6 +1327,7 @@ keep:
+ 		stat->nr_ref_keep = nr_ref_keep;
+ 		stat->nr_unmap_fail = nr_unmap_fail;
+ 	}
++
+ 	return nr_reclaimed;
+ }
+ 

@@ -684,7 +684,7 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
     pr_info_ratelimited("back pressure happened on reads");
   }
 
-  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+  ret = get_req_for_page(&req, dev, page, DMA_FROM_DEVICE);
   if (unlikely(ret))
     return ret;
 

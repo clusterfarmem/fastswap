@@ -2,6 +2,7 @@
 
 #include <linux/highmem.h>
 #include <linux/pagemap.h>
+#include <linux/delay.h>
 #include "fastswap_dram.h"
 
 #define ONEGB (1024UL*1024*1024)
@@ -20,6 +21,12 @@ int sswap_rdma_write(struct page *page, u64 roffset)
 }
 EXPORT_SYMBOL(sswap_rdma_write);
 
+int sswap_rdma_write_async(struct page *page, u64 roffset)
+{
+	return sswap_rdma_write(page, roffset);
+}
+EXPORT_SYMBOL(sswap_rdma_write_async);
+
 int sswap_rdma_poll_load(int cpu)
 {
 	return 0;
@@ -35,6 +42,7 @@ int sswap_rdma_read_async(struct page *page, u64 roffset)
 	VM_BUG_ON_PAGE(PageUptodate(page), page);
 
 	page_vaddr = kmap_atomic(page);
+	//udelay(15);
 	copy_page(page_vaddr, (void *) (drambuf + roffset));
 	kunmap_atomic(page_vaddr);
 

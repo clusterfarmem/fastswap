@@ -3,6 +3,7 @@
 #include "fastswap_rdma.h"
 #include <linux/slab.h>
 #include <linux/cpumask.h>
+#include <linux/debugfs.h>
 
 static struct sswap_rdma_ctrl *gctrl;
 static int serverport;
@@ -11,6 +12,13 @@ static int numcpus;
 static char serverip[INET_ADDRSTRLEN];
 static char clientip[INET_ADDRSTRLEN];
 static struct kmem_cache *req_cache;
+# define DEBUGFS 0
+#if DEBUGFS
+static struct dentry *debugfs_root = NULL;
+static unsigned long long pending = 0;
+static unsigned long long total_pending = 0;
+static atomic_t diff_cnt = ATOMIC_INIT(0);
+#endif
 module_param_named(sport, serverport, int, 0644);
 module_param_named(nq, numqueues, int, 0644);
 module_param_string(sip, serverip, INET_ADDRSTRLEN, 0644);
@@ -26,6 +34,7 @@ module_param_string(cip, clientip, INET_ADDRSTRLEN, 0644);
 #define QP_MAX_SEND_WR	(4096)
 #define CQ_NUM_CQES	(QP_MAX_SEND_WR)
 #define POLL_BATCH_HIGH (QP_MAX_SEND_WR / 4)
+
 
 static void sswap_rdma_addone(struct ib_device *dev)
 {
@@ -140,10 +149,10 @@ static int sswap_rdma_create_queue_ib(struct rdma_queue *q)
 
   pr_info("start: %s\n", __FUNCTION__);
 
-  if (q->qp_type == QP_READ_ASYNC)
+  if (q->qp_type == QP_READ_ASYNC || q->qp_type == QP_WRITE_ASYNC)
     q->cq = ib_alloc_cq(ibdev, q, CQ_NUM_CQES,
       comp_vector, IB_POLL_SOFTIRQ);
-  else
+  else // QP_READ_SYNC and QP_WRITE_ASYNC_POLL
     q->cq = ib_alloc_cq(ibdev, q, CQ_NUM_CQES,
       comp_vector, IB_POLL_DIRECT);
 
@@ -419,6 +428,9 @@ static int sswap_rdma_create_ctrl(struct sswap_rdma_ctrl **c)
 
 static void __exit sswap_rdma_cleanup_module(void)
 {
+#if DEBUGFS
+  debugfs_remove_recursive(debugfs_root);
+#endif
   sswap_rdma_stopandfree_queues(gctrl);
   ib_unregister_client(&sswap_rdma_ib_client);
   kfree(gctrl);
@@ -445,7 +457,50 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
   kmem_cache_free(req_cache, req);
 }
 
-static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
+static void sswap_rdma_async_write_done(struct ib_cq *cq, struct ib_wc *wc)
+{
+  struct rdma_req *req =
+    container_of(wc->wr_cqe, struct rdma_req, cqe);
+  struct rdma_queue *q = cq->cq_context;
+  struct ib_device *ibdev = q->ctrl->rdev->dev;
+
+  if (unlikely(wc->status != IB_WC_SUCCESS)) {
+    pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
+    //q->write_error = wc->status;
+  }
+  ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);
+
+  complete(&req->done);
+  atomic_dec(&q->pending);
+
+  end_page_writeback(req->page);
+#if DEBUGFS
+  atomic_dec_return(&diff_cnt);
+#endif
+  kmem_cache_free(req_cache, req);
+#if 0
+  BUG();
+
+  static unsigned long long skipped = 0;
+  static struct page *pages[100];
+  static unsigned long page_ind = 0;
+
+  if(! PageWriteback(req->page))
+  {
+	  int i;
+	  pages[page_ind++] = req->page;
+	  printk("hha4434 %p", req->page);
+	  for (i = 0; i < page_ind; i++)
+		  printk("page %p writeback? %d", pages[i], PageWriteback(pages[i]));
+
+	  skipped++;
+	  kmem_cache_free(req_cache, req);
+	  return;
+  }
+#endif
+}
+
+static void sswap_rdma_read_done_sync(struct ib_cq *cq, struct ib_wc *wc)
 {
   struct rdma_req *req =
     container_of(wc->wr_cqe, struct rdma_req, cqe);
@@ -457,6 +512,26 @@ static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
 
   ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_FROM_DEVICE);
 
+  //udelay(DELAY_AMOUNT);
+  SetPageUptodate(req->page);
+  unlock_page(req->page);
+  complete(&req->done);
+  atomic_dec(&q->pending);
+  kmem_cache_free(req_cache, req);
+}
+static void sswap_rdma_read_done_async(struct ib_cq *cq, struct ib_wc *wc)
+{
+  struct rdma_req *req =
+    container_of(wc->wr_cqe, struct rdma_req, cqe);
+  struct rdma_queue *q = cq->cq_context;
+  struct ib_device *ibdev = q->ctrl->rdev->dev;
+
+  if (unlikely(wc->status != IB_WC_SUCCESS))
+    pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
+
+  ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_FROM_DEVICE);
+
+  //udelay(DELAY_AMOUNT);
   SetPageUptodate(req->page);
   unlock_page(req->page);
   complete(&req->done);
@@ -614,6 +689,20 @@ inline static void sswap_rdma_wait_completion(struct ib_cq *cq,
   }
 }
 
+static inline int poll_target_min(struct rdma_queue *q, int target, int min_completed)
+{
+  unsigned long flags;
+  int completed = 0;
+
+  do {
+    spin_lock_irqsave(&q->cq_lock, flags);
+    completed += ib_process_cq_direct(q->cq, target - completed);
+    spin_unlock_irqrestore(&q->cq_lock, flags);
+    cpu_relax();
+  } while (completed < min_completed && atomic_read(&q->pending) > 0);
+
+  return completed;
+}
 /* polls queue until we reach target completed wrs or qp is empty */
 static inline int poll_target(struct rdma_queue *q, int target)
 {
@@ -644,6 +733,7 @@ static inline int drain_queue(struct rdma_queue *q)
   return 1;
 }
 
+//TODO::async:: conditionally compile in sync writes only
 static inline int write_queue_add(struct rdma_queue *q, struct page *page,
 				  u64 roffset)
 {
@@ -668,8 +758,40 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
   return ret;
 }
 
+static inline int begin_write(struct rdma_queue *q, struct page *page,
+				  u64 roffset)
+{
+  struct rdma_req *req;
+  struct ib_device *dev = q->ctrl->rdev->dev;
+  struct ib_sge sge = {};
+  int ret, inflight;
+
+  while ((inflight = atomic_read(&q->pending)) >= QP_MAX_SEND_WR - 8) {
+#if DEBUGFS
+	  pending = inflight
+#endif
+    BUG_ON(inflight > QP_MAX_SEND_WR);
+    //TODO::async:: conditionally compile in async polling wirtes
+    //poll_target(q, 2048);
+    pr_info_ratelimited("back pressure bulk writes");
+  }
+  //TODO::async:: conditionally compile in async polling wirtes
+  //poll_target_min(q, 16, 0);
+
+  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+  if (unlikely(ret))
+    return ret;
+
+  req->cqe.done = sswap_rdma_async_write_done;
+#if DEBUGFS
+  atomic_inc(&diff_cnt);
+#endif
+  ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_WRITE);
+
+  return ret;
+}
 static inline int begin_read(struct rdma_queue *q, struct page *page,
-			     u64 roffset)
+			     u64 roffset, bool sync)
 {
   struct rdma_req *req;
   struct ib_device *dev = q->ctrl->rdev->dev;
@@ -688,11 +810,15 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
   if (unlikely(ret))
     return ret;
 
-  req->cqe.done = sswap_rdma_read_done;
+  if (sync)
+	  req->cqe.done = sswap_rdma_read_done_sync;
+  else
+	  req->cqe.done = sswap_rdma_read_done_async;
   ret = sswap_rdma_post_rdma(q, req, &sge, roffset, IB_WR_RDMA_READ);
   return ret;
 }
 
+//TODO::async:: conditionally compile in sync writes only
 int sswap_rdma_write(struct page *page, u64 roffset)
 {
   int ret;
@@ -700,13 +826,55 @@ int sswap_rdma_write(struct page *page, u64 roffset)
 
   VM_BUG_ON_PAGE(!PageSwapCache(page), page);
 
-  q = sswap_rdma_get_queue(smp_processor_id(), QP_WRITE_SYNC);
+  q = sswap_rdma_get_queue(smp_processor_id(), QP_WRITE_ASYNC);
   ret = write_queue_add(q, page, roffset);
   BUG_ON(ret);
   drain_queue(q);
   return ret;
 }
 EXPORT_SYMBOL(sswap_rdma_write);
+
+int sswap_rdma_write_async(struct page *page, u64 roffset)
+{
+  int ret;
+  struct rdma_queue *q;
+
+  VM_BUG_ON_PAGE(!PageSwapCache(page), page);
+
+#if DEBUGFS
+  int i;
+  total_pending = 0;
+  for (i=0; i < numcpus; i++) {
+  	total_pending += atomic_read(&gctrl->queues[i + numcpus * 2].pending);
+  }
+#endif
+
+//TODO::async:: conditionally compile in async writes with polling
+//to make sure there are no pages that do not have their cb handled
+  /*
+  if (total_pending > pending) {
+	  for (i = 0; i < numcpus; i++) {
+		  q = sswap_rdma_get_queue(i, QP_WRITE_ASYNC);
+		  drain_queue(q);
+	  }
+  }
+  */
+
+  q = sswap_rdma_get_queue(smp_processor_id(), QP_WRITE_ASYNC);
+
+  ret = begin_write(q, page, roffset);
+  BUG_ON(ret);
+
+//TODO::async:: conditionally compile in async polling wirtes
+/*  if (atomic_read(&q->pending) > 8)
+	  poll_target_min(q, 8, 1);
+  else
+
+	  poll_target_min(q, 8, 0);
+*/
+  return ret;
+}
+EXPORT_SYMBOL(sswap_rdma_write_async);
 
 static int sswap_rdma_recv_remotemr(struct sswap_rdma_ctrl *ctrl)
 {
@@ -750,7 +918,7 @@ int sswap_rdma_read_async(struct page *page, u64 roffset)
   VM_BUG_ON_PAGE(PageUptodate(page), page);
 
   q = sswap_rdma_get_queue(smp_processor_id(), QP_READ_ASYNC);
-  ret = begin_read(q, page, roffset);
+  ret = begin_read(q, page, roffset, false);
   return ret;
 }
 EXPORT_SYMBOL(sswap_rdma_read_async);
@@ -765,7 +933,7 @@ int sswap_rdma_read_sync(struct page *page, u64 roffset)
   VM_BUG_ON_PAGE(PageUptodate(page), page);
 
   q = sswap_rdma_get_queue(smp_processor_id(), QP_READ_SYNC);
-  ret = begin_read(q, page, roffset);
+  ret = begin_read(q, page, roffset, true);
   return ret;
 }
 EXPORT_SYMBOL(sswap_rdma_read_sync);
@@ -786,7 +954,7 @@ inline enum qp_type get_queue_type(unsigned int idx)
   else if (idx < numcpus * 2)
     return QP_READ_ASYNC;
   else if (idx < numcpus * 3)
-    return QP_WRITE_SYNC;
+    return QP_WRITE_ASYNC;
 
   BUG();
   return QP_READ_SYNC;
@@ -802,7 +970,7 @@ inline struct rdma_queue *sswap_rdma_get_queue(unsigned int cpuid,
       return &gctrl->queues[cpuid];
     case QP_READ_ASYNC:
       return &gctrl->queues[cpuid + numcpus];
-    case QP_WRITE_SYNC:
+    case QP_WRITE_ASYNC:
       return &gctrl->queues[cpuid + numcpus * 2];
     default:
       BUG();
@@ -812,6 +980,13 @@ inline struct rdma_queue *sswap_rdma_get_queue(unsigned int cpuid,
 static int __init sswap_rdma_init_module(void)
 {
   int ret;
+
+#if DEBUGFS
+  debugfs_root = debugfs_create_dir("fastswap", NULL);
+  debugfs_create_u64("pending", 0666, debugfs_root, &pending);
+  debugfs_create_u64("total_pending", 0666, debugfs_root, &total_pending);
+  debugfs_create_atomic_t("diff_cnt", 0666, debugfs_root, &diff_cnt);
+#endif
 
   pr_info("start: %s\n", __FUNCTION__);
   pr_info("* RDMA BACKEND *");

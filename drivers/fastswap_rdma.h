@@ -14,7 +14,10 @@
 enum qp_type {
   QP_READ_SYNC,
   QP_READ_ASYNC,
-  QP_WRITE_SYNC
+  // Note:: one and only one of the next three must be active at any given time
+  QP_WRITE_SYNC,
+  QP_WRITE_ASYNC,
+  QP_WRITE_ASYNC_POLL
 };
 
 struct sswap_rdma_dev {
@@ -73,6 +76,7 @@ enum qp_type get_queue_type(unsigned int idx);
 int sswap_rdma_read_async(struct page *page, u64 roffset);
 int sswap_rdma_read_sync(struct page *page, u64 roffset);
 int sswap_rdma_write(struct page *page, u64 roffset);
+int sswap_rdma_write_async(struct page *page, u64 roffset);
 int sswap_rdma_poll_load(int cpu);
 
 #endif

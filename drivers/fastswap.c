@@ -38,6 +38,16 @@ static int sswap_store(unsigned type, pgoff_t pageid,
   return 0;
 }
 
+static int sswap_store_async(unsigned type, pgoff_t pageid,
+        struct page *page)
+{
+  if (sswap_rdma_write_async(page, pageid << PAGE_SHIFT)) {
+    pr_err("could not async-store page remotely\n");
+    return -1;
+  }
+
+  return 0;
+}
 /*
  * return 0 if page is returned
  * return -1 otherwise
@@ -85,6 +95,7 @@ static void sswap_init(unsigned type)
 static struct frontswap_ops sswap_frontswap_ops = {
   .init = sswap_init,
   .store = sswap_store,
+  .store_async = sswap_store_async,
   .load = sswap_load,
   .poll_load = sswap_poll_load,
   .load_async = sswap_load_async,

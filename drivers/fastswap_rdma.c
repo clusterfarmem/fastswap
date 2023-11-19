@@ -107,7 +107,7 @@ static int sswap_rdma_create_qp(struct rdma_queue *queue)
   init_attr.send_cq = queue->cq;
   init_attr.recv_cq = queue->cq;
   /* just to check if we are compiling against the right headers */
-  init_attr.create_flags = IB_QP_EXP_CREATE_ATOMIC_BE_REPLY & 0;
+  init_attr.create_flags = 0;
 
   ret = rdma_create_qp(queue->cm_id, rdev->pd, &init_attr);
   if (ret) {
@@ -704,6 +704,12 @@ int sswap_rdma_write(struct page *page, u64 roffset)
   ret = write_queue_add(q, page, roffset);
   BUG_ON(ret);
   drain_queue(q);
+
+  atomic_inc(&num_swap_pages);
+  if(num_swap_pages % 1024 == 0) {
+    pr_info("num_swap_pages = %d\n", num_swap_pages);
+  }
+
   return ret;
 }
 EXPORT_SYMBOL(sswap_rdma_write);
@@ -751,6 +757,12 @@ int sswap_rdma_read_async(struct page *page, u64 roffset)
 
   q = sswap_rdma_get_queue(smp_processor_id(), QP_READ_ASYNC);
   ret = begin_read(q, page, roffset);
+
+  atomic_dec(&num_swap_pages);
+  if(num_swap_pages % 1024 == 0) {
+    pr_info("num_swap_pages = %d\n", num_swap_pages);
+  }
+
   return ret;
 }
 EXPORT_SYMBOL(sswap_rdma_read_async);
@@ -766,6 +778,12 @@ int sswap_rdma_read_sync(struct page *page, u64 roffset)
 
   q = sswap_rdma_get_queue(smp_processor_id(), QP_READ_SYNC);
   ret = begin_read(q, page, roffset);
+
+  atomic_dec(&num_swap_pages);
+  if(num_swap_pages % 1024 == 0) {
+    pr_info("num_swap_pages = %d\n", num_swap_pages);
+  }
+  
   return ret;
 }
 EXPORT_SYMBOL(sswap_rdma_read_sync);

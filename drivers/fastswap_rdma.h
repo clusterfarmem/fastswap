@@ -10,6 +10,7 @@
 #include <linux/gfp.h>
 #include <linux/pagemap.h>
 #include <linux/spinlock.h>
+#include <linux/types.h>
 
 enum qp_type {
   QP_READ_SYNC,
@@ -67,6 +68,8 @@ struct sswap_rdma_ctrl {
     struct sockaddr_in srcaddr_in;
   };
 };
+
+atomic_t num_swap_pages = ATOMIC_INIT(0);
 
 struct rdma_queue *sswap_rdma_get_queue(unsigned int idx, enum qp_type type);
 enum qp_type get_queue_type(unsigned int idx);
